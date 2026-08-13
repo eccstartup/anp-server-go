@@ -1,4 +1,4 @@
-module github.com/ANPWorld/anp-server-go
+module github.com/eccstartup/anp-server-go
 
 go 1.26.5
 

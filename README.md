@@ -3,7 +3,7 @@
 ANP 协议裸服务器——与你本地的 anp-cli 通信的 SQLite 持久化后端。
 
 - **位置**：`/Users/eccstartup/code/claude/anp-server-go/`
-- **模块**：`github.com/ANPWorld/anp-server-go`（独立于 CLI，无交叉依赖）
+- **模块**：`github.com/eccstartup/anp-server-go`（独立于 CLI，无交叉依赖）
 - **协议**：`POST /rpc`，JSON-RPC 2.0 + HTTP Message Signatures（[协议文档](../anp-cli/docs/protocol.md)）
 
 ## 快速启动
