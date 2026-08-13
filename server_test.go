@@ -111,7 +111,7 @@ func TestServerPersistence(t *testing.T) {
 	}
 	srv.mu.Lock()
 	srv.didRegisterDocument(map[string]any{"did": "did:wba:x", "did_document": map[string]any{"id": "did:wba:x"}})
-	srv.handleRegister(map[string]any{"handle": "x.agent", "did": "did:wba:x"})
+	srv.handleRegister("", map[string]any{"handle": "x.agent", "did": "did:wba:x"})
 	srv.msgSend("", map[string]any{"to": "did:wba:y", "body": map[string]any{"text": "hello"}})
 	srv.mu.Unlock()
 	_ = srv.db.Close()
@@ -135,5 +135,80 @@ func TestServerPersistence(t *testing.T) {
 	_ = srv2.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&msgCount)
 	if msgCount != 1 {
 		t.Fatalf("messages not persisted: got %d", msgCount)
+	}
+}
+
+func TestServerBodyLimit(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	srv, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	baseURL, closeFn, err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer closeFn()
+
+	big := strings.Repeat("a", maxBodyBytes+100)
+	resp, err := http.Post(baseURL+"/rpc", "application/json", strings.NewReader(big))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r map[string]any
+	json.Unmarshal(raw, &r)
+	errMap, _ := r["error"].(map[string]any)
+	if errMap == nil || errMap["message"] != "request too large" {
+		t.Fatalf("expected request-too-large, got %v", r)
+	}
+}
+
+func TestServerRegistrationSecurity(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	srv, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	baseURL, closeFn, err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer closeFn()
+
+	post := func(body string) map[string]any {
+		t.Helper()
+		resp, err := http.Post(baseURL+"/rpc", "application/json", strings.NewReader(body))
+		if err != nil { t.Fatalf("POST: %v", err) }
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var r map[string]any
+		json.Unmarshal(raw, &r)
+		return r
+	}
+
+	// 1. A new DID may register unsigned (bootstrap).
+	r := post(`{"jsonrpc":"2.0","method":"did.register_document","params":{"did":"did:a","did_document":{"id":"did:a"}},"id":1}`)
+	if r["error"] != nil {
+		t.Fatalf("first registration should succeed: %v", r)
+	}
+
+	// 2. A second, different DID may also register (no deadlock for new peers).
+	r = post(`{"jsonrpc":"2.0","method":"did.register_document","params":{"did":"did:b","did_document":{"id":"did:b"}},"id":2}`)
+	if r["error"] != nil {
+		t.Fatalf("second registration should succeed: %v", r)
+	}
+
+	// 3. Re-registering an EXISTING did without the owner's signature is rejected.
+	r = post(`{"jsonrpc":"2.0","method":"did.register_document","params":{"did":"did:a","did_document":{"id":"did:a"}},"id":3}`)
+	if r["error"] == nil {
+		t.Fatalf("expected overwrite to be rejected: %v", r)
+	}
+
+	// 4. doc.id must match the registered did.
+	r = post(`{"jsonrpc":"2.0","method":"did.register_document","params":{"did":"did:c","did_document":{"id":"did:evil"}},"id":4}`)
+	if r["error"] == nil {
+		t.Fatalf("expected doc.id mismatch to be rejected: %v", r)
 	}
 }

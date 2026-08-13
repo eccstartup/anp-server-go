@@ -27,11 +27,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// maxBodyBytes caps the in-memory size of an inbound JSON-RPC body, so an
+// oversized or malicious request cannot exhaust server memory.
+const maxBodyBytes = 1 << 20 // 1 MiB
+
 // Server is a persisted ANP backend.
 type Server struct {
-	db   *sql.DB
-	stop chan struct{}
-	mu   sync.Mutex
+	db      *sql.DB
+	stop    chan struct{}
+	mu      sync.Mutex
+	nextMsg int64
 }
 
 // New creates a Server with a database file at dbPath (created if absent).
@@ -90,6 +95,10 @@ func ensureSchema(db *sql.DB) error {
 			group_did TEXT PRIMARY KEY, name TEXT, owner_did TEXT,
 			members_json TEXT, created_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS group_members (
+			group_did TEXT NOT NULL, member_did TEXT NOT NULL,
+			PRIMARY KEY (group_did, member_did)
+		);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -138,48 +147,72 @@ type rpcRequest struct {
 	ID      any            `json:"id"`
 }
 
-func writeRPC(w http.ResponseWriter, id any, result any, errMsg string) {
-	resp := map[string]any{"jsonrpc": "2.0", "id": id}
-	if errMsg != "" {
-		resp["error"] = map[string]any{"code": -32000, "message": errMsg}
-	} else {
-		resp["result"] = result
-	}
+func writeRPCResult(w http.ResponseWriter, id any, result any) {
+	resp := map[string]any{"jsonrpc": "2.0", "id": id, "result": result}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeRPCError(w http.ResponseWriter, id any, code int, errMsg string) {
+	resp := map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": errMsg}}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	if r.Method != http.MethodPost {
+		writeRPCError(w, nil, -32600, "method not allowed")
+		return
+	}
+
+	// Bound the read: ignore the client-supplied Content-Length (which may be
+	// -1 for chunked bodies) and cap at maxBodyBytes to avoid a huge or
+	// negative allocation.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		writeRPCError(w, nil, -32700, "read error")
+		return
+	}
+	if len(body) > maxBodyBytes {
+		writeRPCError(w, nil, -32600, "request too large")
+		return
+	}
 
 	var req rpcRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeRPC(w, nil, nil, "parse error")
+		writeRPCError(w, nil, -32700, "parse error")
 		return
 	}
 
 	headers := httpHeaders(r)
-	authDID := ""
 
-	// did.register_document is the bootstrap path: unsigned, registers a DID
-	// document so subsequent signed calls pass verification.
-	if req.Method != "did.register_document" {
-		did, err := s.verify(r, headers, body)
-		if err != nil {
-			writeRPC(w, req.ID, nil, err.Error())
-			return
-		}
-		authDID = did
+	// Authenticate. did.register_document is special: a NEW did may register
+	// unsigned (that is the bootstrap path), while re-registering an EXISTING
+	// did requires the owner's signature against the currently stored document.
+	// Every other method uses the general signature check.
+	var authDID string
+	if req.Method == "did.register_document" {
+		authDID, err = s.verifyRegistration(req.Params, r, headers, body)
+	} else {
+		authDID, err = s.verify(r, headers, body)
+	}
+	if err != nil {
+		writeRPCError(w, req.ID, -32000, err.Error())
+		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result, err := s.dispatch(req.Method, req.Params, authDID)
 	if err != nil {
-		writeRPC(w, req.ID, nil, err.Error())
+		code := -32000
+		if strings.HasPrefix(err.Error(), "unknown method") {
+			code = -32601
+		}
+		writeRPCError(w, req.ID, code, err.Error())
 		return
 	}
-	writeRPC(w, req.ID, result, "")
+	writeRPCResult(w, req.ID, result)
 }
 
 // verify checks HTTP Message Signatures against registered DID documents.
@@ -198,7 +231,11 @@ func (s *Server) verify(r *http.Request, headers map[string]string, body []byte)
 	if signatureInput == "" {
 		return "", fmt.Errorf("missing Signature-Input header")
 	}
-	requestURL := "http://" + r.Host + r.URL.Path
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	requestURL := scheme + "://" + r.Host + r.URL.Path
 
 	rows, err := s.db.Query(`SELECT did, doc_json FROM registered_dids`)
 	if err != nil {
@@ -230,6 +267,47 @@ func keyIDToDID(keyID string) string {
 	return keyID
 }
 
+// verifyRegistration authenticates a did.register_document call. A brand-new
+// DID may register unsigned (the bootstrap path); an already-registered DID
+// must prove ownership by signing with its currently stored document. This
+// lets new identities join after the first boot without opening the door to
+// overwriting someone else's document.
+func (s *Server) verifyRegistration(params map[string]any, r *http.Request, headers map[string]string, body []byte) (string, error) {
+	did, _ := params["did"].(string)
+	if did == "" {
+		return "", fmt.Errorf("did is required")
+	}
+	var docJSON string
+	err := s.db.QueryRow(`SELECT doc_json FROM registered_dids WHERE did = ?`, did).Scan(&docJSON)
+	if err == sql.ErrNoRows {
+		// New DID: allow unsigned registration (bootstrap).
+		return did, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("internal error")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(docJSON), &doc); err != nil {
+		return "", fmt.Errorf("internal error")
+	}
+	if headerGet(headers, "Signature-Input") == "" {
+		return "", fmt.Errorf("missing Signature-Input header")
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	requestURL := scheme + "://" + r.Host + r.URL.Path
+	meta, err := anpauth.VerifyHTTPMessageSignature(doc, http.MethodPost, requestURL, headers, body)
+	if err != nil {
+		return "", fmt.Errorf("signature verification failed")
+	}
+	if keyIDToDID(meta.KeyID) != did {
+		return "", fmt.Errorf("signature does not match DID %q", did)
+	}
+	return did, nil
+}
+
 // ---------------------------------------------------------------- dispatch
 
 func (s *Server) dispatch(method string, params map[string]any, authDID string) (any, error) {
@@ -241,11 +319,11 @@ func (s *Server) dispatch(method string, params map[string]any, authDID string) 
 	case "msg.history":
 		return s.msgHistory(authDID, params)
 	case "group.create":
-		return s.groupCreate(params)
+		return s.groupCreate(authDID, params)
 	case "group.join":
-		return s.groupJoin(params)
+		return s.groupJoin(authDID, params)
 	case "group.leave":
-		return s.groupLeave(params)
+		return s.groupLeave(authDID, params)
 	case "group.members":
 		return s.groupMembers(params)
 	case "did.resolve":
@@ -253,13 +331,13 @@ func (s *Server) dispatch(method string, params map[string]any, authDID string) 
 	case "did.register_document":
 		return s.didRegisterDocument(params)
 	case "handle.register":
-		return s.handleRegister(params)
+		return s.handleRegister(authDID, params)
 	case "handle.recover":
 		return map[string]any{"status": "recovered"}, nil
 	case "direct.send":
 		return s.directSend(authDID, params)
 	case "direct.e2ee.publish_prekey_bundle":
-		return s.e2eePublishPrekeyBundle(params)
+		return s.e2eePublishPrekeyBundle(authDID, params)
 	case "direct.e2ee.get_prekey_bundle":
 		return s.e2eeGetPrekeyBundle(params)
 	default:
@@ -274,6 +352,9 @@ func (s *Server) didRegisterDocument(params map[string]any) (any, error) {
 	doc, _ := params["did_document"].(map[string]any)
 	if did == "" || doc == nil {
 		return nil, fmt.Errorf("did and did_document are required")
+	}
+	if docID, _ := doc["id"].(string); docID != "" && docID != did {
+		return nil, fmt.Errorf("did_document.id %q does not match did %q", docID, did)
 	}
 	raw, _ := json.Marshal(doc)
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -306,9 +387,14 @@ func (s *Server) didResolve(params map[string]any) (any, error) {
 
 // ---------------------------------------------------------------- handle
 
-func (s *Server) handleRegister(params map[string]any) (any, error) {
+func (s *Server) handleRegister(authDID string, params map[string]any) (any, error) {
 	handle, _ := params["handle"].(string)
 	did, _ := params["did"].(string)
+	// Bind the handle to the authenticated caller, never to a client-supplied
+	// DID (which would let anyone squat a handle under someone else's identity).
+	if authDID != "" {
+		did = authDID
+	}
 	if handle == "" || did == "" {
 		return nil, fmt.Errorf("handle and did are required")
 	}
@@ -335,11 +421,21 @@ func (s *Server) msgSend(authDID string, params map[string]any) (any, error) {
 	if to == "" && group == "" {
 		return nil, fmt.Errorf("either to or group is required")
 	}
+	if group != "" {
+		member, err := s.isGroupMember(group, authDID)
+		if err != nil {
+			return nil, err
+		}
+		if !member {
+			return nil, fmt.Errorf("not a member of group %q", group)
+		}
+	}
 	text := ""
 	if bodyMap != nil {
 		text, _ = bodyMap["text"].(string)
 	}
-	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	s.nextMsg++
+	msgID := fmt.Sprintf("msg_%d", s.nextMsg)
 	sentAt := time.Now().UTC().Format(time.RFC3339)
 	recipient := to
 	if group != "" {
@@ -356,24 +452,24 @@ func (s *Server) msgInbox(authDID string, params map[string]any) (any, error) {
 	scope, _ := params["scope"].(string)
 	limit := 100
 	if v, ok := params["limit"].(float64); ok {
-		limit = int(v)
+		if v >= 1 && v <= 1000 && v == v && v <= 1<<53 {
+			limit = int(v)
+		}
 	}
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+	q := `SELECT message_id, sender_did, recipient_did, group_did, type, text, secure, sent_at, wire_meta, wire_body FROM messages WHERE `
+	args := []any{}
+	switch scope {
+	case "direct":
+		q += `recipient_did = ?`
+		args = append(args, authDID)
+	case "group":
+		q += `group_did IN (SELECT group_did FROM group_members WHERE member_did = ?)`
+		args = append(args, authDID)
+	default: // "all"
+		q += `(recipient_did = ? OR group_did IN (SELECT group_did FROM group_members WHERE member_did = ?))`
+		args = append(args, authDID, authDID)
 	}
-	where := []string{"recipient_did = ?"}
-	args := []any{authDID}
-	if scope == "direct" {
-		where = append(where, "group_did IS NULL")
-	}
-	if scope == "group" {
-		where = append(where, "group_did IS NOT NULL")
-	}
-	q := "SELECT message_id, sender_did, recipient_did, group_did, type, text, secure, sent_at, wire_meta, wire_body FROM messages"
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
-	}
-	q += " ORDER BY id DESC LIMIT ?"
+	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := s.db.Query(q, args...)
@@ -410,7 +506,9 @@ func (s *Server) msgHistory(authDID string, params map[string]any) (any, error) 
 	peer, _ := params["with"].(string)
 	limit := 50
 	if v, ok := params["limit"].(float64); ok {
-		limit = int(v)
+		if v >= 1 && v <= 1000 && v == v && v <= 1<<53 {
+			limit = int(v)
+		}
 	}
 	rows, err := s.db.Query(`SELECT message_id, sender_did, recipient_did, group_did, type, text, secure, sent_at FROM messages WHERE (sender_did = ? AND recipient_did = ?) OR (sender_did = ? AND recipient_did = ?) ORDER BY id DESC LIMIT ?`, authDID, peer, peer, authDID, limit)
 	if err != nil {
@@ -435,22 +533,28 @@ func (s *Server) msgHistory(authDID string, params map[string]any) (any, error) 
 
 // ---------------------------------------------------------------- group
 
-func (s *Server) groupCreate(params map[string]any) (any, error) {
+func (s *Server) groupCreate(authDID string, params map[string]any) (any, error) {
 	name, _ := params["name"].(string)
-	members := []any{}
-	if raw, ok := params["members"].([]any); ok {
-		members = raw
-	}
 	gid := fmt.Sprintf("did:wba:%s:group:g%d", "server", time.Now().UnixNano())
-	membersJSON, _ := json.Marshal(members)
-	if _, err := s.db.Exec(`INSERT INTO groups (group_did, name, members_json, created_at) VALUES (?,?,?,?)`,
-		gid, name, string(membersJSON), time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO groups (group_did, name, owner_did, created_at) VALUES (?,?,?,?)`,
+		gid, name, authDID, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
-	return map[string]any{"group_did": gid, "name": name, "members": members}, nil
+	// The creator is always a member.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO group_members (group_did, member_did) VALUES (?,?)`, gid, authDID); err != nil {
+		return nil, err
+	}
+	if raw, ok := params["members"].([]any); ok {
+		for _, m := range raw {
+			if did, ok := m.(string); ok && did != "" {
+				_, _ = s.db.Exec(`INSERT OR IGNORE INTO group_members (group_did, member_did) VALUES (?,?)`, gid, did)
+			}
+		}
+	}
+	return map[string]any{"group_did": gid, "name": name, "members": s.groupMemberList(gid)}, nil
 }
 
-func (s *Server) groupJoin(params map[string]any) (any, error) {
+func (s *Server) groupJoin(authDID string, params map[string]any) (any, error) {
 	gid, _ := params["group"].(string)
 	if gid == "" {
 		return nil, fmt.Errorf("group is required")
@@ -460,15 +564,27 @@ func (s *Server) groupJoin(params map[string]any) (any, error) {
 	if count == 0 {
 		return nil, fmt.Errorf("group not found")
 	}
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO group_members (group_did, member_did) VALUES (?,?)`, gid, authDID); err != nil {
+		return nil, err
+	}
 	return map[string]any{"status": "joined"}, nil
 }
 
-func (s *Server) groupLeave(params map[string]any) (any, error) {
+func (s *Server) groupLeave(authDID string, params map[string]any) (any, error) {
 	gid, _ := params["group"].(string)
 	if gid == "" {
 		return nil, fmt.Errorf("group is required")
 	}
-	_, _ = s.db.Exec(`DELETE FROM groups WHERE group_did = ?`, gid)
+	// Remove the caller; the group persists for the remaining members, and is
+	// deleted only when its last member leaves.
+	if _, err := s.db.Exec(`DELETE FROM group_members WHERE group_did = ? AND member_did = ?`, gid, authDID); err != nil {
+		return nil, err
+	}
+	var remaining int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM group_members WHERE group_did = ?`, gid).Scan(&remaining)
+	if remaining == 0 {
+		_, _ = s.db.Exec(`DELETE FROM groups WHERE group_did = ?`, gid)
+	}
 	return map[string]any{"status": "left"}, nil
 }
 
@@ -477,16 +593,36 @@ func (s *Server) groupMembers(params map[string]any) (any, error) {
 	if gid == "" {
 		return nil, fmt.Errorf("group is required")
 	}
-	var membersJSON string
-	if err := s.db.QueryRow(`SELECT members_json FROM groups WHERE group_did = ?`, gid).Scan(&membersJSON); err != nil {
+	var count int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM groups WHERE group_did = ?`, gid).Scan(&count)
+	if count == 0 {
 		return nil, fmt.Errorf("group not found")
 	}
-	var members []any
-	_ = json.Unmarshal([]byte(membersJSON), &members)
-	if members == nil {
-		members = []any{}
+	return map[string]any{"members": s.groupMemberList(gid)}, nil
+}
+
+func (s *Server) groupMemberList(gid string) []any {
+	rows, err := s.db.Query(`SELECT member_did FROM group_members WHERE group_did = ? ORDER BY member_did`, gid)
+	if err != nil {
+		return []any{}
 	}
-	return map[string]any{"members": members}, nil
+	defer rows.Close()
+	members := []any{}
+	for rows.Next() {
+		var did string
+		if rows.Scan(&did) == nil && did != "" {
+			members = append(members, did)
+		}
+	}
+	return members
+}
+
+func (s *Server) isGroupMember(gid, did string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM group_members WHERE group_did = ? AND member_did = ?`, gid, did).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // ---------------------------------------------------------------- direct E2EE
@@ -497,7 +633,12 @@ func (s *Server) directSend(authDID string, params map[string]any) (any, error) 
 	target, _ := meta["target"].(map[string]any)
 	peerDID, _ := target["did"].(string)
 	messageID, _ := meta["message_id"].(string)
-	senderDID, _ := meta["sender_did"].(string)
+	// The sender is the authenticated identity, never the client-supplied
+	// meta.sender_did (which would allow impersonation of another DID).
+	senderDID := authDID
+	if senderDID == "" {
+		senderDID, _ = meta["sender_did"].(string) // first-boot fallback
+	}
 	if messageID == "" {
 		return nil, fmt.Errorf("message_id is required")
 	}
@@ -510,10 +651,15 @@ func (s *Server) directSend(authDID string, params map[string]any) (any, error) 
 	return map[string]any{"message_id": messageID, "state": "delivered", "sent_at": time.Now().UTC().Format(time.RFC3339)}, nil
 }
 
-func (s *Server) e2eePublishPrekeyBundle(params map[string]any) (any, error) {
+func (s *Server) e2eePublishPrekeyBundle(authDID string, params map[string]any) (any, error) {
 	body, _ := params["body"].(map[string]any)
 	bundle, _ := body["prekey_bundle"].(map[string]any)
 	ownerDID, _ := bundle["owner_did"].(string)
+	// A prekey bundle may only be published by its owner; otherwise an attacker
+	// could overwrite a victim's bundle and decrypt their E2EE messages.
+	if authDID != "" {
+		ownerDID = authDID
+	}
 	if ownerDID == "" {
 		return nil, fmt.Errorf("prekey_bundle.owner_did is required")
 	}
