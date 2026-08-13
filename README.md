@@ -2,14 +2,14 @@
 
 ANP 协议裸服务器——与你本地的 anp-cli 通信的 SQLite 持久化后端。
 
-- **位置**：`/Users/eccstartup/code/claude/anp-server-go/`
+- **位置**：与 `anp-cli` 并列的独立仓库
 - **模块**：`github.com/eccstartup/anp-server-go`（独立于 CLI，无交叉依赖）
 - **协议**：`POST /rpc`，JSON-RPC 2.0 + HTTP Message Signatures（[协议文档](../anp-cli/docs/protocol.md)）
 
 ## 快速启动
 
 ```bash
-cd /Users/eccstartup/code/claude/anp-server-go
+cd anp-server-go
 go run ./cmd/anp-server
 # 输出：http://127.0.0.1:XXXXX
 # stderr：[anp-server] listening on http://127.0.0.1:XXXXX  (db: /tmp/anp-server-xxxxx.db)
@@ -30,7 +30,7 @@ go run ./cmd/anp-server --host 0.0.0.0 --port 8765 --db ./data.db
 
 **终端 A**（起服务器）：
 ```bash
-cd /Users/eccstartup/code/claude/anp-server-go
+cd anp-server-go
 go run ./cmd/anp-server --db ./data.db
 # 记下它打印的 URL，假设是 http://127.0.0.1:54321
 ```
@@ -77,7 +77,7 @@ anp-cli msg inbox --format table         # 之前发的消息还在
 ## 测试
 
 ```bash
-cd /Users/eccstartup/code/claude/anp-server-go
+cd anp-server-go
 go test ./...       # 3 项测试：首次引导 / 抢注 / 持久化
 go vet ./...
 ```
