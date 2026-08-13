@@ -6,12 +6,12 @@
 #   ./scripts/install.sh              # 构建并安装到 PATH 上
 #   ./scripts/start.sh                # 启动服务器（后台/前台可选）
 #   ./scripts/start.sh --foreground   # 前台运行（Ctrl-C 停止）
-#   ./scripts/start.sh --db ./mydata.db --port 8765
+#   ./scripts/start.sh --db ./mydata.db --port 9000
 #
 # 环境变量（也可用命令行参数）:
 #   ANP_SERVER_DB     数据库文件（默认 ./data.db）
 #   ANP_SERVER_HOST   监听地址（默认 127.0.0.1）
-#   ANP_SERVER_PORT   监听端口（默认 0 = 随机）
+#   ANP_SERVER_PORT   监听端口（默认 8765）
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ die()   { printf '\033[1;31m[anp-server]\033[0m %s\n' "$*" >&2; exit 1; }
 FOREGROUND=""
 DB="${ANP_SERVER_DB:-$DEFAULT_DB}"
 HOST="${ANP_SERVER_HOST:-127.0.0.1}"
-PORT="${ANP_SERVER_PORT:-0}"
+PORT="${ANP_SERVER_PORT:-8765}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
       echo "  --foreground, -f    前台运行（Ctrl-C 停止）"
       echo "  --db path           数据库文件（默认 ./data.db，留空用临时库）"
       echo "  --host h            监听地址（默认 127.0.0.1）"
-      echo "  --port p            监听端口（默认随机）"
+      echo "  --port p            监听端口（默认 8765，0 = 随机）"
       echo ""
       echo "环境变量: ANP_SERVER_DB  ANP_SERVER_HOST  ANP_SERVER_PORT"
       exit 0

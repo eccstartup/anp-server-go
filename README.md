@@ -11,8 +11,8 @@ ANP 协议裸服务器——与你本地的 anp-cli 通信的 SQLite 持久化�
 ```bash
 cd anp-server-go
 go run ./cmd/anp-server
-# 输出：http://127.0.0.1:XXXXX
-# stderr：[anp-server] listening on http://127.0.0.1:XXXXX  (db: /tmp/anp-server-xxxxx.db)
+# 输出：http://127.0.0.1:8765
+# stderr：[anp-server] listening on http://127.0.0.1:8765  (db: /tmp/anp-server-xxxxx.db)
 ```
 
 或持久化数据库（推荐手测用）：
@@ -21,9 +21,9 @@ go run ./cmd/anp-server --db ./data.db
 # 重启后数据不丢失
 ```
 
-指定端口：
+换端口 / 对外监听（默认 `8765`，一般不用改；`--port 0` 表示随机）：
 ```bash
-go run ./cmd/anp-server --host 0.0.0.0 --port 8765 --db ./data.db
+go run ./cmd/anp-server --host 0.0.0.0 --port 9000 --db ./data.db
 ```
 
 ## 与 CLI 一起测试
@@ -32,13 +32,13 @@ go run ./cmd/anp-server --host 0.0.0.0 --port 8765 --db ./data.db
 ```bash
 cd anp-server-go
 go run ./cmd/anp-server --db ./data.db
-# 记下它打印的 URL，假设是 http://127.0.0.1:54321
+# 默认固定端口：http://127.0.0.1:8765
 ```
 
 **终端 B**（用 CLI 操作）：
 ```bash
 export ANP_WORKSPACE=/tmp/my-test
-export ANP_BACKEND=http://127.0.0.1:54321
+export ANP_BACKEND=http://127.0.0.1:8765
 
 anp-cli init alice
 anp-cli register --handle alice.agent
