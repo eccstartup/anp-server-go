@@ -26,7 +26,7 @@ func ensureSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_did);`,
 		`CREATE INDEX IF NOT EXISTS idx_msg_group ON messages(group_did);`,
 		`CREATE TABLE IF NOT EXISTS handles (
-			handle TEXT PRIMARY KEY, did TEXT NOT NULL, phone TEXT, email TEXT, recovery_otp TEXT, registered_at TEXT NOT NULL
+			handle TEXT PRIMARY KEY, did TEXT NOT NULL, registered_at TEXT NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS groups (
 			group_did TEXT PRIMARY KEY,
@@ -108,11 +108,9 @@ func ensureSchema(db *sql.DB) error {
 			return err
 		}
 	}
-	// Migrate older databases that predate the phone/email/recovery_otp columns
-	// on handles. ALTER TABLE ADD COLUMN errors if the column already exists,
-	// so ignore.
-	for _, col := range []string{"phone TEXT", "email TEXT", "recovery_otp TEXT"} {
-		_, _ = db.Exec(`ALTER TABLE handles ADD COLUMN ` + col)
-	}
+	// handle binding is authenticated purely by HTTP Message Signatures (the
+	// caller's DID); phone/email/OTP were removed because this server has no
+	// verification channel for them. A legacy DB may still carry those columns
+	// on handles, but they are no longer read or written.
 	return nil
 }

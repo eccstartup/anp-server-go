@@ -223,76 +223,40 @@ func TestServerHandleRecover(t *testing.T) {
 	}
 	defer srv.db.Close()
 
-	// Register a handle bound to alice, with full recovery credentials.
+	// Register a handle bound to alice (no email — binding is by signature).
 	srv.mu.Lock()
 	_, err = srv.handleRegister("did:wba:alice", map[string]any{
 		"handle": "alice.example.com",
-		"phone":  "13800000000",
-		"email":  "alice@example.com",
-		"otp":    "recovery-secret-123",
 	})
 	srv.mu.Unlock()
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	// 1. Recover with matching phone → success, re-bound to the new DID.
+	// 1. Recover by the current owner (matching DID) → success (idempotent).
 	srv.mu.Lock()
-	res, err := srv.handleRecover("did:wba:alice2", map[string]any{
+	res, err := srv.handleRecover("did:wba:alice", map[string]any{
 		"handle": "alice.example.com",
-		"phone":  "13800000000",
 	})
 	srv.mu.Unlock()
 	if err != nil {
-		t.Fatalf("recover with phone: %v", err)
+		t.Fatalf("recover by owner: %v", err)
 	}
-	if rm, _ := res.(map[string]any); rm["did"] != "did:wba:alice2" {
-		t.Fatalf("expected re-bind to did:wba:alice2, got %v", rm["did"])
-	}
-	var boundDID string
-	_ = srv.db.QueryRow(`SELECT did FROM handles WHERE handle = ?`, "alice.example.com").Scan(&boundDID)
-	if boundDID != "did:wba:alice2" {
-		t.Fatalf("handle not re-bound: %s", boundDID)
+	if rm, _ := res.(map[string]any); rm["did"] != "did:wba:alice" {
+		t.Fatalf("expected did:wba:alice, got %v", rm["did"])
 	}
 
-	// 2. Wrong phone → rejected.
+	// 2. Recover by a different DID → rejected (no cross-DID recovery channel).
 	srv.mu.Lock()
 	_, err = srv.handleRecover("did:wba:evil", map[string]any{
 		"handle": "alice.example.com",
-		"phone":  "99999999999",
 	})
 	srv.mu.Unlock()
 	if err == nil {
-		t.Fatalf("wrong phone must be rejected")
+		t.Fatalf("recover by another DID must be rejected")
 	}
 
-	// 3. Arbitrary OTP (not the recorded one) must NOT pass — regression guard
-	//    against the old "any non-empty otp passes" hole.
-	srv.mu.Lock()
-	_, err = srv.handleRecover("did:wba:evil", map[string]any{
-		"handle": "alice.example.com",
-		"otp":    "anything",
-	})
-	srv.mu.Unlock()
-	if err == nil {
-		t.Fatalf("arbitrary otp must NOT pass recovery")
-	}
-
-	// 4. Matching OTP → success.
-	srv.mu.Lock()
-	res, err = srv.handleRecover("did:wba:alice3", map[string]any{
-		"handle": "alice.example.com",
-		"otp":    "recovery-secret-123",
-	})
-	srv.mu.Unlock()
-	if err != nil {
-		t.Fatalf("recover with matching otp: %v", err)
-	}
-	if rm, _ := res.(map[string]any); rm["did"] != "did:wba:alice3" {
-		t.Fatalf("expected re-bind to did:wba:alice3, got %v", rm["did"])
-	}
-
-	// 5. Unknown handle → did-not-found error code.
+	// 3. Unknown handle → did-not-found error code.
 	srv.mu.Lock()
 	_, err = srv.handleRecover("did:wba:x", map[string]any{"handle": "nobody.agent"})
 	srv.mu.Unlock()

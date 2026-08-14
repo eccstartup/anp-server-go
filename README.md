@@ -81,7 +81,7 @@ anp-cli msg inbox --format table         # 之前发的消息还在
 | `did.resolve` | 解析 DID 或 handle |
 | `did.register_document` | 注册 DID 文档（引导用） |
 | `handle.register` | 注册 WNS handle（`localpart.domain`）；重复注册 → handle_taken |
-| `handle.recover` | 恢复 handle（phone / email / recovery OTP 任一匹配，重新绑定） |
+| `handle.recover` | 重新绑定 handle（仅限当前 owner 签名，同 DID） |
 
 附加能力：**P8 联邦**（`serviceDid` 服务级签名 + `operation_id` 幂等去重）、**P9 提及**（`mentions` 字段轻量校验 + 透传）。
 
