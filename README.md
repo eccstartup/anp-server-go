@@ -69,7 +69,7 @@ anp-cli msg inbox --format table         # 之前发的消息还在
 | `did.resolve` | 解析 DID 或 handle |
 | `did.register_document` | 注册 DID 文档（引导用） |
 | `handle.register` | 注册 handle；重复注册 → handle_taken |
-| `handle.recover` | 恢复 handle |
+| `handle.recover` | 恢复 handle（phone / email / recovery OTP 任一匹配注册凭据，重新绑定到新身份） |
 | `direct.send` | E2EE direct 加密消息 |
 | `direct.e2ee.publish_prekey_bundle` | 发布预密钥 bundle |
 | `direct.e2ee.get_prekey_bundle` | 获取对方预密钥 bundle |
@@ -78,7 +78,7 @@ anp-cli msg inbox --format table         # 之前发的消息还在
 
 ```bash
 cd anp-server-go
-go test ./...       # 3 项测试：首次引导 / 抢注 / 持久化
+go test ./...       # 9 项测试：首次引导 / 抢注 / 持久化 / 消息计数重启 / 请求体上限 / 注册安全 / handle 恢复 / 错误码 / SSRF 防护
 go vet ./...
 ```
 
@@ -89,3 +89,23 @@ flowchart LR
     CLI["anp-cli"] -->|POST /rpc + HTTP Signatures| SRV["anp-server"]
     SRV --> DB["SQLite (registered_dids / messages / handles / prekey_bundles / groups)"]
 ```
+
+## 目录结构
+
+```
+anp-server-go/
+├── cmd/anp-server/main.go      # 入口：参数解析 + 监听 + 优雅关闭
+└── internal/server/            # server 包（单 package，按领域分文件）
+    ├── server.go               # Server 类型 + 生命周期（New/Close/Start/Handler/JSONSnapshot）
+    ├── rpc.go                  # JSON-RPC 入口、错误码、dispatch 路由
+    ├── auth.go                 # HTTP Message Signature 验证
+    ├── did.go                  # DID 注册/解析 + SSRF 防护
+    ├── handle.go               # handle register/recover
+    ├── msg.go                  # msg.send / inbox / history
+    ├── group.go                # 群组生命周期
+    ├── e2ee.go                 # direct.send + prekey bundle + origin proof
+    ├── schema.go               # SQLite schema + 迁移
+    └── helpers.go              # 小工具函数
+```
+
+`internal/` 是 Go 的约定：其下包仅本模块可见，外部项目无法 import，明确表达「这是内部实现、不是公共 API」。

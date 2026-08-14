@@ -49,3 +49,18 @@ temp/
 /build/
 
 data.db*
+*.sqlite
+*.sqlite3
+
+# 密钥 / 凭据（严禁提交）
+*.pem
+*.key
+*.jwk
+*.p12
+*.pfx
+*.crt
+id_rsa*
+*.pem.*
+*.key.*
+
+.workbuddy/
