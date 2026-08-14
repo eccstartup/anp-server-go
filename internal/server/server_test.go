@@ -35,24 +35,18 @@ func TestServerFirstBoot(t *testing.T) {
 	}
 
 	// First-boot: no DIDs registered, all requests accepted.
-	r := post(`{"jsonrpc":"2.0","method":"msg.send","params":{"to":"did:wba:ex:bob","body":{"text":"hello"}},"id":1}`)
-	if r["result"] == nil {
-		t.Fatalf("msg.send (first-boot): %v", r)
-	}
-
-	r = post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"alice.agent","did":"did:wba:ex:alice"},"id":2}`)
+	r := post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"alice.example.com","did":"did:wba:ex:alice"},"id":2}`)
 	if r["result"] == nil {
 		t.Fatalf("handle.register (first-boot): %v", r)
 	}
 
-	r = post(`{"jsonrpc":"2.0","method":"group.create","params":{"name":"team"},"id":3}`)
-	result, _ := r["result"].(map[string]any)
-	if result["group_did"] == nil {
-		t.Fatalf("group.create: %v", r)
+	// Direct E2EE send (first-boot): sender DID falls back to meta.sender_did.
+	r = post(`{"jsonrpc":"2.0","method":"direct.send","params":{"meta":{"message_id":"msg_test1","sender_did":"did:wba:ex:alice","target":{"did":"did:wba:ex:bob"},"operation_id":"msg_test1","content_type":"application/anp-direct-init+json"},"body":{"session_id":"s1"}},"id":3}`)
+	if r["result"] == nil {
+		t.Fatalf("direct.send (first-boot): %v", r)
 	}
-	t.Logf("group: %s", result["group_did"])
 
-	// Inbox.
+	// Inbox (empty at first boot since no DID is authenticated).
 	r = post(`{"jsonrpc":"2.0","method":"msg.inbox","params":{},"id":4}`)
 	t.Logf("inbox: %v", r)
 
@@ -90,12 +84,12 @@ func TestServerSquatting(t *testing.T) {
 	}
 
 	// First claim.
-	r := post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"x","did":"did:a"},"id":1}`)
+	r := post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"x.example.com","did":"did:a"},"id":1}`)
 	if r["result"] == nil {
 		t.Fatalf("first claim: %v", r)
 	}
 	// Squatting (different DID, same handle).
-	r = post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"x","did":"did:b"},"id":2}`)
+	r = post(`{"jsonrpc":"2.0","method":"handle.register","params":{"handle":"x.example.com","did":"did:b"},"id":2}`)
 	if r["error"] == nil {
 		t.Fatalf("expected squatting error: %v", r)
 	}
@@ -114,8 +108,11 @@ func TestServerPersistence(t *testing.T) {
 	}
 	srv.mu.Lock()
 	srv.didRegisterDocument(map[string]any{"did": "did:wba:x", "did_document": map[string]any{"id": "did:wba:x"}})
-	srv.handleRegister("", map[string]any{"handle": "x.agent", "did": "did:wba:x"})
-	srv.msgSend("", map[string]any{"to": "did:wba:y", "body": map[string]any{"text": "hello"}})
+	srv.handleRegister("", map[string]any{"handle": "x.example.com", "did": "did:wba:x"})
+	srv.directSend("did:wba:x", map[string]any{
+		"meta": map[string]any{"message_id": "msg_persist1", "sender_did": "did:wba:x", "target": map[string]any{"did": "did:wba:y"}, "operation_id": "msg_persist1"},
+		"body": map[string]any{},
+	})
 	srv.mu.Unlock()
 	_ = srv.db.Close()
 
@@ -128,52 +125,17 @@ func TestServerPersistence(t *testing.T) {
 	defer srv2.mu.Unlock()
 
 	var handleDID string
-	_ = srv2.db.QueryRow(`SELECT did FROM handles WHERE handle = ?`, "x.agent").Scan(&handleDID)
+	_ = srv2.db.QueryRow(`SELECT did FROM handles WHERE handle = ?`, "x.example.com").Scan(&handleDID)
 	if handleDID == "" {
 		t.Fatalf("handle not persisted")
 	}
-	t.Logf("handle persisted: x.agent -> %s", handleDID)
+	t.Logf("handle persisted: x.example.com -> %s", handleDID)
 
 	var msgCount int
 	_ = srv2.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&msgCount)
 	if msgCount != 1 {
 		t.Fatalf("messages not persisted: got %d", msgCount)
 	}
-}
-
-func TestServerMessageIDAfterRestart(t *testing.T) {
-	dbPath := t.TempDir() + "/restart.db"
-	srv, err := New(dbPath)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	srv.mu.Lock()
-	_, err = srv.msgSend("", map[string]any{"to": "did:wba:y", "body": map[string]any{"text": "hello"}})
-	srv.mu.Unlock()
-	if err != nil {
-		t.Fatalf("first send: %v", err)
-	}
-	_ = srv.db.Close()
-
-	// Restart and send again — the counter must resume, not collide on the
-	// UNIQUE(message_id) constraint.
-	srv2, err := New(dbPath)
-	if err != nil {
-		t.Fatalf("New(2): %v", err)
-	}
-	defer srv2.db.Close()
-	srv2.mu.Lock()
-	defer srv2.mu.Unlock()
-	res, err := srv2.msgSend("", map[string]any{"to": "did:wba:y", "body": map[string]any{"text": "again"}})
-	if err != nil {
-		t.Fatalf("send after restart: %v", err)
-	}
-	resMap, _ := res.(map[string]any)
-	mid, _ := resMap["message_id"].(string)
-	if mid == "msg_1" {
-		t.Fatalf("message id collided after restart: %s", mid)
-	}
-	t.Logf("message id after restart: %s", mid)
 }
 
 func TestServerBodyLimit(t *testing.T) {
@@ -264,7 +226,7 @@ func TestServerHandleRecover(t *testing.T) {
 	// Register a handle bound to alice, with full recovery credentials.
 	srv.mu.Lock()
 	_, err = srv.handleRegister("did:wba:alice", map[string]any{
-		"handle": "alice.agent",
+		"handle": "alice.example.com",
 		"phone":  "13800000000",
 		"email":  "alice@example.com",
 		"otp":    "recovery-secret-123",
@@ -277,7 +239,7 @@ func TestServerHandleRecover(t *testing.T) {
 	// 1. Recover with matching phone → success, re-bound to the new DID.
 	srv.mu.Lock()
 	res, err := srv.handleRecover("did:wba:alice2", map[string]any{
-		"handle": "alice.agent",
+		"handle": "alice.example.com",
 		"phone":  "13800000000",
 	})
 	srv.mu.Unlock()
@@ -288,7 +250,7 @@ func TestServerHandleRecover(t *testing.T) {
 		t.Fatalf("expected re-bind to did:wba:alice2, got %v", rm["did"])
 	}
 	var boundDID string
-	_ = srv.db.QueryRow(`SELECT did FROM handles WHERE handle = ?`, "alice.agent").Scan(&boundDID)
+	_ = srv.db.QueryRow(`SELECT did FROM handles WHERE handle = ?`, "alice.example.com").Scan(&boundDID)
 	if boundDID != "did:wba:alice2" {
 		t.Fatalf("handle not re-bound: %s", boundDID)
 	}
@@ -296,7 +258,7 @@ func TestServerHandleRecover(t *testing.T) {
 	// 2. Wrong phone → rejected.
 	srv.mu.Lock()
 	_, err = srv.handleRecover("did:wba:evil", map[string]any{
-		"handle": "alice.agent",
+		"handle": "alice.example.com",
 		"phone":  "99999999999",
 	})
 	srv.mu.Unlock()
@@ -308,7 +270,7 @@ func TestServerHandleRecover(t *testing.T) {
 	//    against the old "any non-empty otp passes" hole.
 	srv.mu.Lock()
 	_, err = srv.handleRecover("did:wba:evil", map[string]any{
-		"handle": "alice.agent",
+		"handle": "alice.example.com",
 		"otp":    "anything",
 	})
 	srv.mu.Unlock()
@@ -319,7 +281,7 @@ func TestServerHandleRecover(t *testing.T) {
 	// 4. Matching OTP → success.
 	srv.mu.Lock()
 	res, err = srv.handleRecover("did:wba:alice3", map[string]any{
-		"handle": "alice.agent",
+		"handle": "alice.example.com",
 		"otp":    "recovery-secret-123",
 	})
 	srv.mu.Unlock()
@@ -347,8 +309,8 @@ func TestServerErrorCodes(t *testing.T) {
 
 	// handle_taken → codeHandleTaken.
 	srv.mu.Lock()
-	_, _ = srv.handleRegister("did:a", map[string]any{"handle": "x.agent", "did": "did:a"})
-	_, err = srv.handleRegister("did:b", map[string]any{"handle": "x.agent", "did": "did:b"})
+	_, _ = srv.handleRegister("did:a", map[string]any{"handle": "x.example.com", "did": "did:a"})
+	_, err = srv.handleRegister("did:b", map[string]any{"handle": "x.example.com", "did": "did:b"})
 	srv.mu.Unlock()
 	assertRPCErrorCode(t, err, codeHandleTaken)
 

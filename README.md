@@ -60,25 +60,38 @@ anp-cli msg inbox --format table         # 之前发的消息还在
 
 ## 暴露的方法
 
+本 server 实现 **ANP 分层协议**：Base 语义层（明文 transport-protected，合规）之上叠加可选的安全覆盖层（E2EE）：
+
 | method | 说明 |
 |--------|------|
-| `msg.send` | 发消息（to/group + body） |
-| `msg.inbox` | 收件箱（scope: all/direct/group） |
-| `msg.history` | 会话历史（with + limit） |
-| `group.create/join/leave/members` | 群组生命周期 |
-| `did.resolve` | 解析 DID 或 handle |
-| `did.register_document` | 注册 DID 文档（引导用） |
-| `handle.register` | 注册 handle；重复注册 → handle_taken |
-| `handle.recover` | 恢复 handle（phone / email / recovery OTP 任一匹配注册凭据，重新绑定到新身份） |
-| `direct.send` | E2EE direct 加密消息 |
+| `direct.send` | direct 消息（`anp.direct.base.v1` 明文 / `anp.direct.e2ee.v1` 加密） |
+| `direct.incoming` | direct 推送通知（占位，OPTIONAL） |
 | `direct.e2ee.publish_prekey_bundle` | 发布预密钥 bundle |
 | `direct.e2ee.get_prekey_bundle` | 获取对方预密钥 bundle |
+| `group.create` / `group.get_info` | 创建 / 查询群组 |
+| `group.join` / `group.add` / `group.remove` / `group.leave` | 群组成员管理 |
+| `group.update_profile` / `group.update_policy` | 更新群组资料 / 策略 |
+| `group.send` | 群组明文消息 |
+| `group.incoming` / `group.state_changed` | 群组推送通知（占位，OPTIONAL） |
+| `group.rebind_member` | 成员身份重新绑定（新 DID） |
+| `group.e2ee.publish_key_package` / `group.e2ee.get_key_package` | 群组 E2EE 密钥包发布 / 获取（P6，MLS 对象不透明存储） |
+| `group.e2ee.create` / `add` / `remove` / `send` / `notice` | 群组 E2EE 控制面（P6，仅存储/转发 MLS 对象，MLS 计算在 agent 侧） |
+| `attachment.create_slot` / `commit_object` / `abort_object` / `get_download_ticket` | 附件控制面（P7）+ 数据面 `PUT /upload/{slot_id}` / `GET /objects/{object_id}` |
+| `msg.inbox` | 收件箱（direct + 群组消息，返回 `{server_seq, meta, body}`） |
+| `did.resolve` | 解析 DID 或 handle |
+| `did.register_document` | 注册 DID 文档（引导用） |
+| `handle.register` | 注册 WNS handle（`localpart.domain`）；重复注册 → handle_taken |
+| `handle.recover` | 恢复 handle（phone / email / recovery OTP 任一匹配，重新绑定） |
+
+附加能力：**P8 联邦**（`serviceDid` 服务级签名 + `operation_id` 幂等去重）、**P9 提及**（`mentions` 字段轻量校验 + 透传）。
+
+任何实现 ANP 标准（did:wba + RFC 9421 签名 + base/e2ee profile）的第三方客户端都能直接连接。
 
 ## 测试
 
 ```bash
 cd anp-server-go
-go test ./...       # 9 项测试：首次引导 / 抢注 / 持久化 / 消息计数重启 / 请求体上限 / 注册安全 / handle 恢复 / 错误码 / SSRF 防护
+go test ./...       # 首次引导 / 抢注 / 持久化 / 请求体上限 / 注册安全 / handle 恢复 / 错误码 / SSRF 防护 / 群组生命周期 / 群组权限 / 群组发送 / direct 明文 / dispatch 路由
 go vet ./...
 ```
 
@@ -86,8 +99,8 @@ go vet ./...
 
 ```mermaid
 flowchart LR
-    CLI["anp-cli"] -->|POST /rpc + HTTP Signatures| SRV["anp-server"]
-    SRV --> DB["SQLite (registered_dids / messages / handles / prekey_bundles / groups)"]
+    CLI["anp-cli / 任意 ANP 客户端"] -->|POST /rpc + HTTP Signatures| SRV["anp-server"]
+    SRV --> DB["SQLite (registered_dids / messages / handles / groups / group_members / prekey_bundles / one_time_prekeys / group_key_packages / group_e2ee_states / attachment_* / idempotency)"]
 ```
 
 ## 目录结构
@@ -100,10 +113,13 @@ anp-server-go/
     ├── rpc.go                  # JSON-RPC 入口、错误码、dispatch 路由
     ├── auth.go                 # HTTP Message Signature 验证
     ├── did.go                  # DID 注册/解析 + SSRF 防护
-    ├── handle.go               # handle register/recover
-    ├── msg.go                  # msg.send / inbox / history
-    ├── group.go                # 群组生命周期
-    ├── e2ee.go                 # direct.send + prekey bundle + origin proof
+    ├── handle.go               # handle register/recover（WNS localpart.domain）
+    ├── msg.go                  # inbox（direct + 群组消息）
+    ├── group.go                # 群组 base 语义（12 个 JSON-RPC 方法）
+    ├── group_e2ee.go           # 群组 E2EE 控制面（P6，MLS 对象不透明存储/转发）
+    ├── e2ee.go                 # direct.send（base 明文 / e2ee 加密）+ prekey bundle + origin proof
+    ├── attachment.go           # 附件控制面 + 数据面（P7）
+    ├── mentions.go             # 群消息 mentions 校验（P9）
     ├── schema.go               # SQLite schema + 迁移
     └── helpers.go              # 小工具函数
 ```

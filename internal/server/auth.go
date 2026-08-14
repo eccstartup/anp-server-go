@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -41,6 +42,13 @@ func (s *Server) verify(r *http.Request, headers map[string]string, body []byte)
 	}
 	var docJSON string
 	if err := s.db.QueryRow(`SELECT doc_json FROM registered_dids WHERE did = ?`, did).Scan(&docJSON); err != nil {
+		// Cross-domain service-level signature (P8): when the server has a
+		// configured serviceDid, accept signatures verified against a remotely
+		// resolvable service DID document (did:wba / did:web). Single-domain
+		// mode (serviceDid == "") keeps the original behavior unchanged.
+		if s.serviceDid != "" {
+			return s.verifyServiceSignature(did, requestURL, headers, body)
+		}
 		return "", fmt.Errorf("signature verification failed")
 	}
 	var doc map[string]any
@@ -50,6 +58,30 @@ func (s *Server) verify(r *http.Request, headers map[string]string, body []byte)
 	meta, err := anpauth.VerifyHTTPMessageSignature(doc, http.MethodPost, requestURL, headers, body)
 	if err != nil {
 		return "", fmt.Errorf("signature verification failed")
+	}
+	return keyIDToDID(meta.KeyID), nil
+}
+
+// verifyServiceSignature verifies an HTTP Message Signature from a remote
+// service (cross-domain). The keyid's DID is resolved (locally first, then
+// remote did:wba/did:web) and the signature is checked against that document's
+// authentication methods. Only reachable when serviceDid is configured.
+func (s *Server) verifyServiceSignature(did, requestURL string, headers map[string]string, body []byte) (string, error) {
+	var doc map[string]any
+	var docJSON string
+	if err := s.db.QueryRow(`SELECT doc_json FROM registered_dids WHERE did = ?`, did).Scan(&docJSON); err == nil {
+		_ = json.Unmarshal([]byte(docJSON), &doc)
+	}
+	if doc == nil {
+		resolved, err := anpauth.ResolveDidDocument(context.Background(), did, false)
+		if err != nil {
+			return "", fmt.Errorf("service signature verification failed")
+		}
+		doc = resolved
+	}
+	meta, err := anpauth.VerifyHTTPMessageSignature(doc, http.MethodPost, requestURL, headers, body)
+	if err != nil {
+		return "", fmt.Errorf("service signature verification failed")
 	}
 	return keyIDToDID(meta.KeyID), nil
 }

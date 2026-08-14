@@ -2,8 +2,9 @@ package server
 
 import (
 	"fmt"
-	"strings"
 	"time"
+
+	"github.com/agent-network-protocol/anp/golang/wns"
 )
 
 func (s *Server) handleRegister(authDID string, params map[string]any) (any, error) {
@@ -78,13 +79,9 @@ func (s *Server) handleRecover(authDID string, params map[string]any) (any, erro
 	return map[string]any{"did": newDID, "handle": handle, "status": "recovered"}, nil
 }
 
-// validHandle does a lightweight handle sanity check: non-empty, no surrounding
-// whitespace, no spaces, @, or path separators. Full WNS syntax validation is
-// left to the SDK's wns package (the CLI uses lenient local-part handles).
+// validHandle enforces the WNS handle syntax: localpart.domain (e.g.
+// alice.example.com), validated with the SDK's wns package.
 func validHandle(handle string) bool {
-	h := strings.TrimSpace(handle)
-	if h == "" || h != handle {
-		return false
-	}
-	return !strings.ContainsAny(h, " @/\\")
+	_, _, err := wns.ValidateHandle(handle)
+	return err == nil
 }

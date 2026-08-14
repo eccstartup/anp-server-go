@@ -37,13 +37,21 @@ import (
 
 // Server is a persisted ANP backend.
 type Server struct {
-	db      *sql.DB
-	mu      sync.Mutex
-	nextMsg int64
+	db         *sql.DB
+	mu         sync.Mutex
+	serviceDid string // cross-domain service identity (P8); empty disables it
+	baseURL    string // public base URL for data-plane URIs; empty = relative
 }
 
 // New creates a Server with a database file at dbPath (created if absent).
 func New(dbPath string) (*Server, error) {
+	return NewWithServiceDid(dbPath, "")
+}
+
+// NewWithServiceDid creates a Server with an optional cross-domain service DID
+// (P8). When serviceDid is empty the server operates in single-domain mode and
+// only verifies signatures from locally registered DIDs.
+func NewWithServiceDid(dbPath, serviceDid string) (*Server, error) {
 	if dir := filepath.Dir(dbPath); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
@@ -62,14 +70,16 @@ func New(dbPath string) (*Server, error) {
 		db.Close()
 		return nil, err
 	}
-	// Restore the message counter from the highest existing message id so a
-	// restart does not collide on the UNIQUE(message_id) constraint. Message ids
-	// look like "msg_<n>"; SUBSTR drops the "msg_" prefix.
-	var nextMsg int64
-	if err := db.QueryRow(`SELECT COALESCE(MAX(CAST(SUBSTR(message_id, 5) AS INTEGER)), 0) FROM messages`).Scan(&nextMsg); err != nil {
-		nextMsg = 0
-	}
-	return &Server{db: db, nextMsg: nextMsg}, nil
+	return &Server{db: db, serviceDid: serviceDid}, nil
+}
+
+// SetBaseURL records the server's public base URL so that data-plane URIs
+// (upload_uri / object_uri) can be emitted as absolute URLs. Safe to call
+// before serving begins.
+func (s *Server) SetBaseURL(u string) {
+	s.mu.Lock()
+	s.baseURL = u
+	s.mu.Unlock()
 }
 
 // Close releases the underlying database connection. It is not safe to use the
@@ -85,9 +95,11 @@ func (s *Server) Start() (baseURL string, closeFn func(), err error) {
 	if err != nil {
 		return "", nil, err
 	}
+	baseURL = "http://" + listener.Addr().String()
+	s.SetBaseURL(baseURL)
 	httpServer := &http.Server{Handler: s.handler()}
 	go func() { _ = httpServer.Serve(listener) }()
-	return "http://" + listener.Addr().String(), func() {
+	return baseURL, func() {
 		_ = httpServer.Shutdown(context.Background())
 		s.db.Close()
 	}, nil
@@ -100,6 +112,9 @@ func (s *Server) handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// P7 data plane: upload + download endpoints.
+	mux.HandleFunc("PUT /upload/{slot_id}", s.handleUpload)
+	mux.HandleFunc("GET /objects/{object_id}", s.handleDownload)
 	return mux
 }
 
